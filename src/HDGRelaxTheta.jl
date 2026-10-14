@@ -33,7 +33,7 @@ module HDGRelaxTheta
 
 using LinearAlgebra, SparseArrays
 
-export Atmosphere, FrozenState, frozen_from_atmosphere, HDGRelaxTh,
+export AbstractHDGOperator, Atmosphere, FrozenState, frozen_from_atmosphere, HDGRelaxTh,
        gauss_legendre, gll, lagrange_basis, iq, it, blk, nodes,
        hydrostatic_rho, balanced_state, forcing_vector, tendency, energy,
        project, evaluate, l2_error, total, initial_state, trace_residual, run!,
@@ -133,7 +133,12 @@ end
 # ---------------------------------------------------------------------------
 # Discretization
 # ---------------------------------------------------------------------------
-struct HDGRelaxTh
+"""Common supertype of the fast HDG operators. Required fields: K, G, H, L, Mbig, Mdiag, fb,
+nq, nt, eps. `run!` (:dirk, :imex) and `tendency` work for every subtype; :hevi calls
+`run_hevi`, which a subtype has to provide."""
+abstract type AbstractHDGOperator end
+
+struct HDGRelaxTh <: AbstractHDGOperator
     Ne::Int; p::Int; np::Int
     zmin::Float64; zmax::Float64; h::Float64; J::Float64; xe::Vector{Float64}
     fr::Union{FrozenState,Nothing}; bc::Symbol; form::Symbol; eps::Float64; g::Float64
@@ -353,14 +358,14 @@ end
 # ---------------------------------------------------------------------------
 # Operators and helpers
 # ---------------------------------------------------------------------------
-function forcing_vector(s::HDGRelaxTh, F_slow = nothing)
+function forcing_vector(s::AbstractHDGOperator, F_slow = nothing)
     f = copy(s.fb)
     F_slow === nothing || (f .+= s.Mdiag .* F_slow)
     return vcat(f, zeros(s.nt))
 end
 
 """dq/dt of the fast operator (HDG limit q̂ = H q unless qh is given)."""
-function tendency(s::HDGRelaxTh, q; qh = nothing, F_slow = nothing)
+function tendency(s::AbstractHDGOperator, q; qh = nothing, F_slow = nothing)
     qh === nothing && (qh = s.H * q)
     out = (s.K * q .+ s.G * qh .+ s.fb) ./ s.Mdiag
     F_slow === nothing || (out .+= F_slow)
@@ -442,8 +447,8 @@ end
 
 """Discrete integral Σ J w_i q_i of variable r (1 mass, 2 momentum, 3 Θ)."""
 total(s::HDGRelaxTh, q, r) = s.J * sum(dot(s.wg, blk(s, q, e, r)) for e in 1:s.Ne)
-initial_state(s::HDGRelaxTh, q) = vcat(q, s.H * q)
-trace_residual(s::HDGRelaxTh, U) = maximum(abs.(s.H * U[1:s.nq] .- U[s.nq+1:end]))
+initial_state(s::AbstractHDGOperator, q) = vcat(q, s.H * q)
+trace_residual(s::AbstractHDGOperator, U) = maximum(abs.(s.H * U[1:s.nq] .- U[s.nq+1:end]))
 
 # ---------------------------------------------------------------------------
 # Time integration
@@ -453,15 +458,19 @@ trace_residual(s::HDGRelaxTh, U) = maximum(abs.(s.H * U[1:s.nq] .- U[s.nq+1:end]
 
 `F_slow`: constant tendency of the element unknowns (slow forcing, split-explicit).
 """
-function run!(s::HDGRelaxTh, U0, dt, nsteps; method::Symbol = :dirk, F_slow = nothing,
+function run!(s::AbstractHDGOperator, U0, dt, nsteps; method::Symbol = :dirk, F_slow = nothing,
               monitor = nothing, every::Int = 1)
     f = forcing_vector(s, F_slow)
     method == :dirk && return run_dirk(s, U0, dt, nsteps, f, monitor, every)
     method == :imex && return run_imex(s, U0, dt, nsteps, f, monitor, every)
+    method == :hevi && return run_hevi(s, U0, dt, nsteps, f, monitor, every)
     error("unknown method $method")
 end
 
-function run_dirk(s::HDGRelaxTh, U0, dt, nsteps, f, monitor, every)
+"""HEVI integration of the fast system; implemented by operators that split K = K_h + K_v."""
+function run_hevi end
+
+function run_dirk(s::AbstractHDGOperator, U0, dt, nsteps, f, monitor, every)
     a = [1/4       0           0       0        0;
          1/2       1/4         0       0        0;
          17/50     (-1/25)     1/4     0        0;
@@ -489,7 +498,7 @@ function run_dirk(s::HDGRelaxTh, U0, dt, nsteps, f, monitor, every)
     return U
 end
 
-function run_imex(s::HDGRelaxTh, U0, dt, nsteps, f, monitor, every)
+function run_imex(s::AbstractHDGOperator, U0, dt, nsteps, f, monitor, every)
     gm = 1 - 1 / sqrt(2); dl = 1 - 1 / (2gm)
     AE = [0.0 0.0 0.0; gm 0.0 0.0; dl (1 - dl) 0.0]
     AI = [0.0 0.0 0.0; 0.0 gm 0.0; 0.0 (1 - gm) gm]

@@ -212,7 +212,7 @@ end
 One large step. The fast operator is re-frozen at q; each stage integrates the fast ODE over
 d_i Δt with ceil(d_i Δt / dτ) substeps.
 """
-function mis_step(eu::Euler1D, q::AbstractVector, Δt::Real, tab::MISTableau; dτ::Real,
+function mis_step(eu, q::AbstractVector, Δt::Real, tab::MISTableau; dτ::Real,
                   fast::Symbol = :imex, pfac = eu.gas.γ, eps = 0.0, sF = nothing)
     sF === nothing && (sF = fast_operator(eu, q; pfac = pfac, eps = eps))
     ns = nstages(tab)
@@ -242,7 +242,7 @@ end
 
 refreeze = false keeps the fast operator frozen at q0 for the whole run.
 """
-function run_mis(eu::Euler1D, q0, Δt, nsteps; tab::MISTableau = mis_tableau(:MIS4a), dτ::Real,
+function run_mis(eu, q0, Δt, nsteps; tab::MISTableau = mis_tableau(:MIS4a), dτ::Real,
                  fast::Symbol = :imex, pfac = eu.gas.γ, eps = 0.0, refreeze::Bool = true,
                  monitor = nothing, every::Int = 1)
     q = copy(q0)
@@ -255,7 +255,7 @@ function run_mis(eu::Euler1D, q0, Δt, nsteps; tab::MISTableau = mis_tableau(:MI
 end
 
 """Classical RK4 on the full nonlinear operator (reference solution)."""
-function run_rk4(eu::Euler1D, q0, dt, nsteps)
+function run_rk4(eu, q0, dt, nsteps)
     q = copy(q0)
     for _ in 1:nsteps
         k1 = rhs_nonlinear(eu, q)
