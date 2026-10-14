@@ -37,7 +37,7 @@ export Atmosphere, FrozenState, frozen_from_atmosphere, HDGRelaxTh,
        gauss_legendre, gll, lagrange_basis, iq, it, blk, nodes,
        hydrostatic_rho, balanced_state, forcing_vector, tendency, energy,
        project, evaluate, l2_error, total, initial_state, trace_residual, run!,
-       atm_T, atm_p, atm_rho, atm_theta, atm_Theta, atm_pi, coef_a, coef_b
+       atm_T, atm_p, atm_rho, atm_theta, atm_Theta, atm_pi, coef_a, coef_b, dss!
 
 const NV = 3
 
@@ -136,7 +136,7 @@ end
 struct HDGRelaxTh
     Ne::Int; p::Int; np::Int
     zmin::Float64; zmax::Float64; h::Float64; J::Float64; xe::Vector{Float64}
-    fr::FrozenState; bc::Symbol; form::Symbol; eps::Float64; g::Float64
+    fr::Union{FrozenState,Nothing}; bc::Symbol; form::Symbol; eps::Float64; g::Float64
     Nf::Int; nq::Int; nt::Int
     xg::Vector{Float64}; wg::Vector{Float64}; Dg::Matrix{Float64}
     Za::Matrix{Float64}; Zth::Matrix{Float64}; Zb::Matrix{Float64}; Zphi::Matrix{Float64}  # (np × Ne)
@@ -180,6 +180,37 @@ function energy_weight(fr::FrozenState, xe, h, xg)
     return Φ
 end
 
+"""Energy weight from nodal coefficients: φ = θ̄ exp(∫ g/(aθ̄)), with g/(aθ̄) replaced by its
+GLL interpolant and integrated exactly; the running integral is continuous across faces."""
+function energy_weight_nodal(Za, Zth, g, J, xg)
+    np, Ne = size(Za)
+    xq, wq = gauss_legendre(np)
+    Iint = zeros(np, np)                               # Iint[i, j] = ∫_{-1}^{ξ_i} ℓ_j
+    for i in 1:np
+        V, _ = lagrange_basis(xg, -1.0 .+ 0.5 * (xg[i] + 1) .* (xq .+ 1))
+        Iint[i, :] = 0.5 * (xg[i] + 1) .* (V' * wq)
+    end
+    Φ = zeros(np, Ne)
+    base = 0.0
+    for e in 1:Ne
+        I = base .+ J .* (Iint * (g ./ (Za[:, e] .* Zth[:, e])))
+        Φ[:, e] = Zth[:, e] .* exp.(I)
+        base = I[end]
+    end
+    return Φ
+end
+
+"""Average the end-node values of a nodal field (np × Ne) at interior faces, making it
+continuous (direct stiffness summation); with bc = :periodic also across the outer face."""
+function dss!(F::AbstractMatrix, bc::Symbol)
+    Ne = size(F, 2)
+    for e in 1:Ne-1
+        F[end, e] = F[1, e+1] = 0.5 * (F[end, e] + F[1, e+1])
+    end
+    bc == :periodic && (F[end, Ne] = F[1, 1] = 0.5 * (F[end, Ne] + F[1, 1]))
+    return F
+end
+
 """
     HDGRelaxTh(Ne, p, zmin, zmax, frozen; bc=:wall, eps=0.0, tau_scale=1.0, form=:split)
 
@@ -189,6 +220,46 @@ function HDGRelaxTh(Ne::Int, p::Int, zmin::Real, zmax::Real, fr::FrozenState;
                     bc::Symbol = :wall, eps::Real = 0.0, tau_scale::Real = 1.0,
                     form::Symbol = :split)
     p >= 1 || error("p >= 1 required")
+    h = (zmax - zmin) / Ne
+    xe = collect(zmin .+ h .* (0:Ne))
+    xg, _ = gll(p)
+    Z = reduce(hcat, [zpts(xe, h, e, xg) for e in 1:Ne])
+    Za = coef_a.(Ref(fr), Z); Zth = fr.theta.(Z); Zb = coef_b.(Ref(fr), Z)
+    Zphi = energy_weight(fr, xe, h, xg)
+    zf = bc == :wall ? xe : xe[1:end-1]
+    af = [coef_a(fr, z) for z in zf]
+    thf = [fr.theta(z) for z in zf]
+    bf = [coef_b(fr, z) for z in xe]
+    return assemble(Ne, p, zmin, zmax, fr, fr.g, Za, Zth, Zb, Zphi, af, thf, bf;
+                    bc = bc, eps = eps, tau_scale = tau_scale, form = form)
+end
+
+"""
+    HDGRelaxTh(Ne, p, zmin, zmax, a, theta, b; g=9.81, bc=:wall, eps=0.0, tau_scale=1.0, form=:split)
+
+Fast operator with frozen coefficients given as nodal arrays (np × Ne) on the GLL nodes, e.g.
+taken from the current state of a split-explicit method. The fields are first made continuous
+(`dss!`, on copies); face values are the common end-node values, and φ is built from the nodal
+interpolant of g/(a θ̄). With continuous coefficients the discrete energy proof applies unchanged.
+"""
+function HDGRelaxTh(Ne::Int, p::Int, zmin::Real, zmax::Real, Za::AbstractMatrix,
+                    Zth::AbstractMatrix, Zb::AbstractMatrix; g::Real = 9.81, bc::Symbol = :wall,
+                    eps::Real = 0.0, tau_scale::Real = 1.0, form::Symbol = :split)
+    p >= 1 || error("p >= 1 required")
+    size(Za) == size(Zth) == size(Zb) == (p + 1, Ne) || error("coefficient arrays must be (p+1) × Ne")
+    Za, Zth, Zb = dss!(Matrix{Float64}(Za), bc), dss!(Matrix{Float64}(Zth), bc), dss!(Matrix{Float64}(Zb), bc)
+    h = (zmax - zmin) / Ne
+    xg, _ = gll(p)
+    Zphi = energy_weight_nodal(Za, Zth, Float64(g), h / 2, xg)
+    Nf = bc == :wall ? Ne + 1 : Ne
+    face(Zc) = [f <= Ne ? Zc[1, f] : Zc[end, Ne] for f in 1:Nf]
+    bf = vcat(Zb[1, :], Zb[end, Ne])
+    return assemble(Ne, p, zmin, zmax, nothing, Float64(g), Za, Zth, Zb, Zphi, face(Za), face(Zth), bf;
+                    bc = bc, eps = eps, tau_scale = tau_scale, form = form)
+end
+
+function assemble(Ne, p, zmin, zmax, fr, g, Za, Zth, Zb, Zphi, af, thf, bf;
+                  bc, eps, tau_scale, form)
     form in (:split, :standard) || error("form must be :split or :standard")
     np = p + 1
     h = (zmax - zmin) / Ne
@@ -197,18 +268,9 @@ function HDGRelaxTh(Ne::Int, p::Int, zmin::Real, zmax::Real, fr::FrozenState;
     Nf = bc == :wall ? Ne + 1 : Ne
     nq = Ne * NV * np
     nt = Nf * NV
-    g = fr.g
     xg, w = gll(p)
     _, D = lagrange_basis(xg, xg)
-
-    Z = reduce(hcat, [zpts(xe, h, e, xg) for e in 1:Ne])
-    Za = coef_a.(Ref(fr), Z); Zth = fr.theta.(Z); Zb = coef_b.(Ref(fr), Z)
-    Zphi = energy_weight(fr, xe, h, xg)
     Mdiag = repeat(w .* J, Ne * NV)
-
-    zf = bc == :wall ? xe : xe[1:end-1]
-    af = [coef_a(fr, z) for z in zf]
-    thf = [fr.theta(z) for z in zf]
     cf = sqrt.(af .* thf)
     Af(f, n) = n .* [0.0 1.0 0.0; 0.0 0.0 af[f]; 0.0 thf[f] 0.0]
     Tf(f) = tau_scale .* [0.0 0.0 af[f]/cf[f]; 0.0 cf[f] 0.0; 0.0 0.0 cf[f]]
@@ -253,7 +315,7 @@ function HDGRelaxTh(Ne::Int, p::Int, zmin::Real, zmax::Real, fr::FrozenState;
                 Mq, Mh = A .- T, -(A .- T)               # (A n - T)(q_b - q̂)
             else
                 Mq, Mh = -T, -(A .- T)                   # -(A n q̂ + T(q_b - q̂))
-                fb[iq(np, e, 2, node)] += n > 0 ? -coef_b(fr, xe[e+1]) : coef_b(fr, xe[e])
+                fb[iq(np, e, 2, node)] += n > 0 ? -bf[e+1] : bf[e]
             end
             for r in 1:NV, s in 1:NV
                 addK!(iq(np, e, r, node), iq(np, e, s, node), Mq[r, s])
