@@ -1,9 +1,8 @@
 # Verification and demo for HDGRelaxTheta.jl (DGSEM, energy-stable split form).
-# Standard library only; writes CSV files.   Run:  julia run_tests_theta.jl
+# Standard library only; writes CSV files.   Run:  julia --project=examples examples/v2_theta_report.jl
 # Python reference values (same algorithm) are given in the comments.
 
-include(joinpath(@__DIR__, "HDGRelaxTheta.jl"))
-using .HDGRelaxTheta
+using HDGEulerGravity.HDGRelaxTheta
 using LinearAlgebra, Printf, Random
 
 fmt(v) = join([@sprintf("%.3e", x) for x in v], "  ")

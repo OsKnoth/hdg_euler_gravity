@@ -1,6 +1,6 @@
-# Optional plots from the CSV files written by run_tests.jl.  Requires Plots.jl:
-#   julia -e 'using Pkg; Pkg.add("Plots")'
-#   julia plot_results.jl
+# Optional plots from the CSV files written by v1_perturbation_report.jl.  Requires Plots.jl:
+#   julia --project=examples -e 'using Pkg; Pkg.add("Plots")'
+#   julia --project=examples examples/v1_plot_results.jl
 using DelimitedFiles, Plots
 
 # ---- convergence + eps sweep

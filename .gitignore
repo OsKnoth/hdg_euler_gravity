@@ -7,3 +7,5 @@
 *.toc
 *.synctex.gz
 .DS_Store
+# Julia environments are resolved locally
+Manifest.toml

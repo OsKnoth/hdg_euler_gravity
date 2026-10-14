@@ -32,8 +32,7 @@ module SplitExplicitEuler
 
 using LinearAlgebra, SparseArrays
 
-include(joinpath(@__DIR__, "..", "..", "v2_theta_dgsem", "julia", "HDGRelaxTheta.jl"))
-using .HDGRelaxTheta
+using ..HDGRelaxTheta
 
 export HDGRelaxTheta, Gas, pressure, Euler1D, rhs_nonlinear, hydrostatic_state, fast_operator,
        MISTableau, mis_tableau, mis_step, run_mis, run_rk4, total, evaluate, l2_error, project,

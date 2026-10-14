@@ -1,6 +1,6 @@
 # Single run of the fast operator (DGSEM split form, LMARS, relaxed traces) with IMEX.
 #
-#     julia run_single_theta.jl
+#     julia --project=examples examples/v2_single_run.jl
 #
 # Setup: lapse-rate atmosphere, reflecting walls, one resolution with polynomial order 4
 # (5 Gauss–Lobatto nodes per element). Initial state = discrete hydrostatic background
@@ -12,8 +12,7 @@
 #   mass drift ~ 4e-12 (total 7.5372e+03), ρθ drift ~ 5e-10 (total 2.2846e+06),
 #   E(T)/E(0) - 1 = -3.29e-06
 
-include(joinpath(@__DIR__, "HDGRelaxTheta.jl"))
-using .HDGRelaxTheta
+using HDGEulerGravity.HDGRelaxTheta
 using Printf
 
 # ------------------------------------------------------------------ parameters

@@ -1,12 +1,11 @@
 # Tests of the split-explicit (MIS) solver for the nonlinear Euler equations with gravity,
 # fast part = HDG/LMARS DGSEM operator of v2 re-frozen at every large step.
 #
-#     julia run_tests_mis.jl
+#     julia --project=examples examples/v3_mis_report.jl
 #
 # Writes mis_convergence.csv, mis_stability_function.csv, mis_long_run.csv.
 
-include(joinpath(@__DIR__, "SplitExplicitEuler.jl"))
-using .SplitExplicitEuler, LinearAlgebra, Printf
+using HDGEulerGravity.SplitExplicitEuler, LinearAlgebra, Printf
 
 const ATM = Atmosphere(T0 = 288.0, Γ = 0.0065)
 const TABLES = (:WSRK3, :MIS2, :MIS4, :MIS4a)

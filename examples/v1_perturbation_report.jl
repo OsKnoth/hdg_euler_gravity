@@ -1,11 +1,11 @@
 # Verification and demo for HDGRelaxEuler.jl (stdlib only; writes CSV files).
-# Run:  julia run_tests.jl        Plots (optional): julia plot_results.jl
+# Run:  julia --project=examples examples/v1_perturbation_report.jl
+#       Plots (optional): julia --project=examples examples/v1_plot_results.jl
 #
 # Reference values from the Python implementation (same algorithm) are given in
 # the comments of each test; Julia should agree to ~3-4 significant digits.
 
-include(joinpath(@__DIR__, "HDGRelaxEuler.jl"))
-using .HDGRelaxEuler
+using HDGEulerGravity.HDGRelaxEuler
 using LinearAlgebra, Printf
 
 fmt(v) = join([@sprintf("%.3e", x) for x in v], "  ")
