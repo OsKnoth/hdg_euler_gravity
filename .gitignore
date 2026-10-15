@@ -9,3 +9,6 @@
 .DS_Store
 # Julia environments are resolved locally
 Manifest.toml
+# simulation output and editor files
+*.vtkhdf
+*.swp
