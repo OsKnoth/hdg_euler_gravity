@@ -8,7 +8,17 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
+[weakdeps]
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+
+[extensions]
+HDGEulerGravityHDF5Ext = "HDF5"
+HDGEulerGravityMakieExt = "Makie"
+
 [compat]
+HDF5 = "0.17"
+Makie = "0.21, 0.22, 0.23, 0.24"
 LinearAlgebra = "1"
 Printf = "1"
 SparseArrays = "1"

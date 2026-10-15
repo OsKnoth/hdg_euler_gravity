@@ -33,7 +33,7 @@ module HDGRelaxTheta
 
 using LinearAlgebra, SparseArrays
 
-export AbstractHDGOperator, Atmosphere, FrozenState, frozen_from_atmosphere, HDGRelaxTh,
+export AbstractHDGOperator, fast_apply!, fast_solve!, fast_workspace, hevi_loop!, verlet_loop!, fb_loop!, Atmosphere, FrozenState, frozen_from_atmosphere, HDGRelaxTh,
        gauss_legendre, gll, lagrange_basis, iq, it, blk, nodes,
        hydrostatic_rho, balanced_state, forcing_vector, tendency, energy,
        project, evaluate, l2_error, total, initial_state, trace_residual, run!,
@@ -133,9 +133,10 @@ end
 # ---------------------------------------------------------------------------
 # Discretization
 # ---------------------------------------------------------------------------
-"""Common supertype of the fast HDG operators. Required fields: K, G, H, L, Mbig, Mdiag, fb,
-nq, nt, eps. `run!` (:dirk, :imex) and `tendency` work for every subtype; :hevi calls
-`run_hevi`, which a subtype has to provide."""
+"""Common supertype of the fast HDG operators. Required fields: Mdiag, fb, nq, nt, eps; sparse
+operators also K, G, H and A = K + G H (ε = 0), matrix-free ones overload `fast_apply!`.
+`run!`/`fast_solve!` (:imex) and `tendency` work for every subtype; :hevi calls `hevi_loop!`,
+which a subtype has to provide."""
 abstract type AbstractHDGOperator end
 
 struct HDGRelaxTh <: AbstractHDGOperator
@@ -152,6 +153,7 @@ struct HDGRelaxTh <: AbstractHDGOperator
     H::SparseMatrixCSC{Float64,Int}
     L::SparseMatrixCSC{Float64,Int}
     Mbig::SparseMatrixCSC{Float64,Int}
+    A::SparseMatrixCSC{Float64,Int}       # K + G H (traces eliminated, ε = 0)
 end
 
 iq(np::Int, e, r, i) = ((e - 1) * NV + (r - 1)) * np + i
@@ -352,7 +354,7 @@ function assemble(Ne, p, zmin, zmax, fr, g, Za, Zth, Zb, Zphi, af, thf, bf;
     L = [K G; H -sparse(1.0I, nt, nt)]
     Mbig = spdiagm(0 => vcat(Mdiag, fill(Float64(eps), nt)))
     return HDGRelaxTh(Ne, p, np, zmin, zmax, h, J, xe, fr, bc, form, Float64(eps), g, Nf, nq, nt,
-                      xg, w, D, Za, Zth, Zb, Zphi, cf, maximum(cf), Mdiag, fb, K, G, H, L, Mbig)
+                      xg, w, D, Za, Zth, Zb, Zphi, cf, maximum(cf), Mdiag, fb, K, G, H, L, Mbig, K + G * H)
 end
 
 # ---------------------------------------------------------------------------
@@ -454,80 +456,130 @@ trace_residual(s::AbstractHDGOperator, U) = maximum(abs.(s.H * U[1:s.nq] .- U[s.
 # Time integration
 # ---------------------------------------------------------------------------
 """
-    run!(s, U0, dt, nsteps; method=:dirk, F_slow=nothing, monitor=nothing, every=1)
+    run!(s, U0, dt, nsteps; method=:imex, F_slow=nothing, monitor=nothing, every=1)
 
-`F_slow`: constant tendency of the element unknowns (slow forcing, split-explicit).
+Fast system M U_t = L U + f. method = :imex (explicit for the element unknowns; with ε > 0 the
+relaxed traces are integrated implicitly, with ε = 0 they are the averages H q) or :hevi
+(operators that split horizontal/vertical). `F_slow`: constant tendency of the element unknowns
+(slow forcing, split-explicit).
 """
-function run!(s::AbstractHDGOperator, U0, dt, nsteps; method::Symbol = :dirk, F_slow = nothing,
+function run!(s::AbstractHDGOperator, U0, dt, nsteps; method::Symbol = :imex, F_slow = nothing,
               monitor = nothing, every::Int = 1)
-    f = forcing_vector(s, F_slow)
-    method == :dirk && return run_dirk(s, U0, dt, nsteps, f, monitor, every)
-    method == :imex && return run_imex(s, U0, dt, nsteps, f, monitor, every)
-    method == :hevi && return run_hevi(s, U0, dt, nsteps, f, monitor, every)
-    error("unknown method $method")
-end
-
-"""HEVI integration of the fast system; implemented by operators that split K = K_h + K_v."""
-function run_hevi end
-
-function run_dirk(s::AbstractHDGOperator, U0, dt, nsteps, f, monitor, every)
-    a = [1/4       0           0       0        0;
-         1/2       1/4         0       0        0;
-         17/50     (-1/25)     1/4     0        0;
-         371/1360  (-137/2720) 15/544  1/4      0;
-         25/24     (-49/48)    125/16  (-85/12) 1/4]
-    F = lu(s.Mbig - (dt * a[1, 1]) * s.L)
-    U = copy(U0)
-    R = [zeros(length(U0)) for _ in 1:5]
-    for n in 1:nsteps
-        MU = s.Mbig * U
-        Y = U
-        for i in 1:5
-            rhs = MU .+ (dt * a[i, i]) .* f
-            for j in 1:i-1
-                rhs .+= (dt * a[i, j]) .* R[j]
-            end
-            Y = F \ rhs
-            R[i] = s.L * Y .+ f
-        end
-        U = Y
-        if monitor !== nothing && n % every == 0
-            monitor(n, U)
+    method in (:imex, :hevi) || error("unknown method $method (available: :imex, :hevi)")
+    if s.eps > 0
+        method == :imex || error("relaxed traces (eps > 0) only with :imex")
+        return run_imex_relaxed(s, U0, dt, nsteps, forcing_vector(s, F_slow), monitor, every)
+    end
+    q = Vector{Float64}(U0[1:s.nq])
+    if monitor === nothing
+        fast_solve!(q, s, q, F_slow, dt, nsteps; method = method)
+    else
+        for n in 1:nsteps
+            fast_solve!(q, s, q, F_slow, dt, 1; method = method)
+            n % every == 0 && monitor(n, initial_state(s, q))
         end
     end
-    return U
+    return initial_state(s, q)
 end
 
-function run_imex(s::AbstractHDGOperator, U0, dt, nsteps, f, monitor, every)
-    gm = 1 - 1 / sqrt(2); dl = 1 - 1 / (2gm)
-    AE = [0.0 0.0 0.0; gm 0.0 0.0; dl (1 - dl) 0.0]
-    AI = [0.0 0.0 0.0; 0.0 gm 0.0; 0.0 (1 - gm) gm]
+"""out = (K q + G H q + f) ./ M (ε = 0 fast tendency; f has length nq). Sparse version;
+matrix-free operators provide their own method."""
+function fast_apply!(out, s::AbstractHDGOperator, q, f)
+    mul!(out, s.A, q)
+    @inbounds for k in eachindex(out)
+        out[k] = (out[k] + f[k]) / s.Mdiag[k]
+    end
+    return out
+end
+
+"""Work vectors (length nq) for the fast integrators: allocated per call here; matrix-free
+operators return cached ones."""
+fast_workspace(s::AbstractHDGOperator) = [zeros(s.nq) for _ in 1:6]
+
+# IMEX tableau (with ε = 0 only the explicit part acts on the element unknowns)
+const IMEX_GM = 1 - 1 / sqrt(2)
+const IMEX_DL = 1 - 1 / (2IMEX_GM)
+const IMEX_AE = [0.0 0.0 0.0; IMEX_GM 0.0 0.0; IMEX_DL (1 - IMEX_DL) 0.0]
+const IMEX_AI = [0.0 0.0 0.0; 0.0 IMEX_GM 0.0; 0.0 (1 - IMEX_GM) IMEX_GM]
+
+"""
+    fast_solve!(qout, s, q0, F_slow, dt, nsteps; method=:imex)
+
+Integrate the fast system (ε = 0) over nsteps steps of size dt with constant slow forcing
+F_slow (or nothing), starting from q0; qout may alias q0. Allocation-free for operators with a
+cached `fast_workspace`.
+"""
+function fast_solve!(qout, s::AbstractHDGOperator, q0, F_slow, dt, nsteps; method::Symbol = :imex)
+    s.eps == 0 || error("fast_solve! needs eps = 0 (use run! for relaxed traces)")
+    f, q, Y, k1, k2, tmp = fast_workspace(s)
+    if F_slow === nothing
+        @. f = s.fb
+    else
+        @. f = s.fb + s.Mdiag * F_slow
+    end
+    q .= q0
+    if method == :imex
+        imex_loop!(q, s, f, dt, nsteps, Y, k1, k2)
+    elseif method == :hevi
+        hevi_loop!(q, s, f, dt, nsteps, Y, k1, k2, tmp)
+    elseif method == :verlet
+        verlet_loop!(q, s, f, dt, nsteps, k1, k2)
+    elseif method == :fb
+        fb_loop!(q, s, f, dt, nsteps, k1, k2)
+    else
+        error("unknown method $method (available: :imex, :hevi, :verlet, :fb)")
+    end
+    qout .= q
+    return qout
+end
+
+function imex_loop!(q, s, f, dt, nsteps, Y, k1, k2)
+    a21, a31, a32 = IMEX_AE[2, 1], IMEX_AE[3, 1], IMEX_AE[3, 2]
+    for _ in 1:nsteps
+        fast_apply!(k1, s, q, f)
+        @. Y = q + (dt * a21) * k1
+        fast_apply!(k2, s, Y, f)
+        @. q = q + dt * (a31 * k1 + a32 * k2)
+    end
+    return q
+end
+
+"""HEVI loop (horizontal explicit, vertical implicit); provided by operators with a vertical split."""
+function hevi_loop! end
+
+"""Störmer–Verlet loop (half step ρ, Θ / full step m / half step ρ, Θ); provided by operators
+that split the fast tendency into a thermodynamic and a momentum part."""
+function verlet_loop! end
+
+"""Forward-backward loop (m explicit, interface momentum implicit, then ρ, Θ with the new
+interface momentum); provided by operators with the thermodynamic/momentum split."""
+function fb_loop! end
+
+"""IMEX with relaxed traces (ε > 0): ε dq̂/dt = H q - q̂ implicit (diagonal), the rest explicit."""
+function run_imex_relaxed(s::AbstractHDGOperator, U0, dt, nsteps, f, monitor, every)
+    AE, AI = IMEX_AE, IMEX_AI
     nq, nt, ε = s.nq, s.nt, s.eps
-    N = nq + nt
-    fq = f[1:nq]
-    fE(U) = vcat((s.K * U[1:nq] .+ s.G * U[nq+1:end] .+ fq) ./ s.Mdiag, zeros(nt))
-    fI(U) = ε > 0 ? vcat(zeros(nq), (s.H * U[1:nq] .- U[nq+1:end]) ./ ε) : zeros(N)
+    fq = view(f, 1:nq)
     U = copy(U0)
+    FE = [zeros(nq + nt) for _ in 1:3]; FI = [zeros(nq + nt) for _ in 1:3]
+    Ys = similar(U); Hq = zeros(nt)
     for n in 1:nsteps
-        FE = Vector{Vector{Float64}}()
-        FI = Vector{Vector{Float64}}()
-        Y = U
         for i in 1:3
-            Ys = copy(U)
+            Ys .= U
             for j in 1:i-1
-                Ys .+= dt .* (AE[i, j] .* FE[j] .+ AI[i, j] .* FI[j])
+                @. Ys += dt * (AE[i, j] * FE[j] + AI[i, j] * FI[j])
             end
-            Y = copy(Ys)
-            Hq = s.H * Y[1:nq]
-            if ε == 0.0
-                Y[nq+1:end] .= Hq
-            else
-                k = dt * AI[i, i] / ε
-                Y[nq+1:end] .= (Ys[nq+1:end] .+ k .* Hq) ./ (1 + k)
-            end
-            push!(FE, fE(Y)); push!(FI, fI(Y))
+            q = view(Ys, 1:nq); qh = view(Ys, nq+1:nq+nt)
+            mul!(Hq, s.H, q)
+            k = dt * AI[i, i] / ε
+            @. qh = (qh + k * Hq) / (1 + k)
+            fe = view(FE[i], 1:nq)
+            mul!(fe, s.K, q); mul!(fe, s.G, qh, 1.0, 1.0)
+            @. fe = (fe + fq) / s.Mdiag
+            mul!(Hq, s.H, q)
+            @. FI[i][nq+1:end] = (Hq - qh) / ε
+            i == 3 && (U .= Ys)
         end
-        U = Y
         if monitor !== nothing && n % every == 0
             monitor(n, U)
         end

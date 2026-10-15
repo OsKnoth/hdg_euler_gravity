@@ -25,8 +25,11 @@ MIS step (Wensch, Knoth, Galant 2009; Knoth, Wensch 2014), slow part S = N - L_n
   Z_i(0) = qⁿ + Σ_{j<i} α_ij (Y_j - qⁿ)
   Z_i'   = L_n(Z_i) + Σ_{j<i} [ γ_ij (Y_j - qⁿ)/(d_i Δt) + β_ij S(Y_j)/d_i ],   τ ∈ [0, d_i Δt]
   Y_i = Z_i(d_i Δt),   qⁿ⁺¹ = Y_{s+1},   d_i = Σ_j β_ij.
-The fast ODE of each stage is integrated by HDGRelaxTheta.run! (method :imex or :dirk) with the
-constant forcing passed as F_slow. Since F_slow = N(Y) - L_n(Y), steady states of N stay steady.
+The fast ODE of each stage is integrated by HDGRelaxTheta.fast_solve! (:imex; for the 2D operator
+also :verlet, :fb, :hevi) with n_i = round(d_i nsub) substeps, nsub = fast/slow ratio
+(WRF: 6 or 12 with RK3; keep ≤ 24), and the constant forcing F_slow. Since F_slow = N(Y) - L_n(Y),
+steady states of N stay steady. mis_step!/run_mis work on preallocated MISWork buffers and the
+in-place rhs_nonlinear!, so a large step does not allocate.
 """
 module SplitExplicitEuler
 
@@ -34,7 +37,7 @@ using LinearAlgebra, SparseArrays
 
 using ..HDGRelaxTheta
 
-export HDGRelaxTheta, Gas, pressure, Euler1D, rhs_nonlinear, hydrostatic_state, fast_operator,
+export HDGRelaxTheta, Gas, pressure, Euler1D, rhs_nonlinear, rhs_nonlinear!, MISWork, mis_step!, stage_substeps, hydrostatic_state, fast_operator,
        MISTableau, mis_tableau, mis_step, run_mis, run_rk4, total, evaluate, l2_error, project,
        blk, iq, nodes, sound_speed_max, Atmosphere, atm_Theta, atm_rho, atm_theta, atm_p
 
@@ -62,13 +65,31 @@ struct Euler1D
     zmin::Float64; zmax::Float64; h::Float64; J::Float64; xe::Vector{Float64}
     gas::Gas; nq::Int
     xg::Vector{Float64}; wg::Vector{Float64}; Dg::Matrix{Float64}
+    vflux::Symbol; gflux::Symbol
+    φ::Matrix{Float64}          # geopotential g z at the nodes (np × Ne)
+    P::Matrix{Float64}          # pressure cache (np × Ne)
 end
-function Euler1D(Ne::Int, p::Int, zmin::Real, zmax::Real, gas::Gas = Gas())
+"""
+    Euler1D(Ne, p, zmin, zmax, gas=Gas(); volume_flux=:tec, gravity=:waruszewski)
+
+volume_flux: :kg (Kennedy–Gruber), :tec, :ec, :etec (total-energy / entropy conservative
+fluxes of Artiano, Knoth, Spichtinger, Ranocha 2025). gravity: :pointwise (-g ρ_i) or the
+non-conservative two-point term ρ_avg (φ_j - φ_i), φ = g z, with ρ_avg = arithmetic (:souza),
+logarithmic (:waruszewski, balanced for isothermal states) or Stolarsky(γ) mean (:artiano,
+balanced for constant θ), as in TrixiAtmo. The pointwise source is only kept for comparison:
+its linearization about a stratified state has a real positive eigenvalue O(h).
+"""
+function Euler1D(Ne::Int, p::Int, zmin::Real, zmax::Real, gas::Gas = Gas();
+                 volume_flux::Symbol = :tec, gravity::Symbol = :waruszewski)
+    volume_flux in (:kg, :tec, :ec, :etec) || error("unknown volume_flux $volume_flux")
+    gravity in (:pointwise, :souza, :waruszewski, :artiano) || error("unknown gravity $gravity")
     h = (zmax - zmin) / Ne
     xg, w = gll(p)
     _, D = lagrange_basis(xg, xg)
-    return Euler1D(Ne, p, p + 1, zmin, zmax, h, h / 2, collect(zmin .+ h .* (0:Ne)), gas,
-                   Ne * NV * (p + 1), xg, w, D)
+    xe = collect(zmin .+ h .* (0:Ne))
+    φ = gas.g .* reduce(hcat, [0.5 * (xe[e] + xe[e+1]) .+ 0.5 * h .* xg for e in 1:Ne])
+    return Euler1D(Ne, p, p + 1, zmin, zmax, h, h / 2, xe, gas, Ne * NV * (p + 1), xg, w, D,
+                   volume_flux, gravity, φ, zeros(p + 1, Ne))
 end
 
 HDGRelaxTheta.iq(eu::Euler1D, e, r, i) = iq(eu.np, e, r, i)
@@ -81,10 +102,48 @@ field(eu::Euler1D, q, r) = reduce(hcat, [Vector(blk(eu, q, e, r)) for e in 1:eu.
 # ---------------------------------------------------------------------------
 # Nonlinear operator
 # ---------------------------------------------------------------------------
-@inline function kg_flux(ρi, wi, θi, pi, ρj, wj, θj, pj)
-    fρ = 0.25 * (ρi + ρj) * (wi + wj)
-    return fρ, 0.5 * fρ * (wi + wj) + 0.5 * (pi + pj), 0.5 * fρ * (θi + θj)
+# two-point means (as in Trixi.jl)
+@inline function ln_mean(x, y)
+    f2 = (x * (x - 2y) + y * y) / (x * (x + 2y) + y * y)
+    f2 < 1e-4 && return (x + y) / @evalpoly(f2, 2, 2 / 3, 2 / 5, 2 / 7)
+    return (y - x) / log(y / x)
 end
+@inline function inv_ln_mean(x, y)
+    f2 = (x * (x - 2y) + y * y) / (x * (x + 2y) + y * y)
+    f2 < 1e-4 && return @evalpoly(f2, 2, 2 / 3, 2 / 5, 2 / 7) / (x + y)
+    return log(y / x) / (y - x)
+end
+@inline function stolarsky_mean(x, y, γ)
+    f2 = (x * (x - 2y) + y * y) / (x * (x + 2y) + y * y)
+    if f2 < 1e-4
+        c1 = (γ - 2) / 3
+        c2 = -(γ + 1) * (γ - 3) * c1 / 15
+        c3 = -(2γ * (γ - 2) - 9) * c2 / 21
+        return 0.5 * (x + y) * @evalpoly(f2, 1, c1, c2, c3)
+    end
+    yg = exp((γ - 1) * log(y)); xg = exp((γ - 1) * log(x))
+    return (γ - 1) * (yg * y - xg * x) / (γ * (yg - xg))
+end
+
+"""Mass and Θ two-point fluxes for the averaged normal velocity vn (momentum flux = f_ρ {v} + {p} n)."""
+@inline function mass_theta_flux(vf::Symbol, ρi, Θi, ρj, Θj, vn, γ)
+    if vf === :kg
+        f1 = 0.5 * (ρi + ρj) * vn
+        return f1, f1 * 0.5 * (Θi / ρi + Θj / ρj)
+    elseif vf === :tec
+        return ln_mean(ρi, ρj) * vn, stolarsky_mean(Θi, Θj, γ) * vn
+    elseif vf === :ec
+        f1 = ln_mean(ρi, ρj) * vn
+        return f1, inv_ln_mean(ρi / Θi, ρj / Θj) * f1
+    else # :etec
+        f3 = stolarsky_mean(Θi, Θj, γ) * vn
+        return f3 * ln_mean(ρi / Θi, ρj / Θj), f3
+    end
+end
+
+"""Density mean of the non-conservative gravity term ρ_avg (φ_j - φ_i)."""
+@inline gravity_mean(gf::Symbol, ρi, ρj, γ) =
+    gf === :souza ? 0.5 * (ρi + ρj) : gf === :waruszewski ? ln_mean(ρi, ρj) : stolarsky_mean(ρi, ρj, γ)
 
 """LMARS flux between left and right states (ρ, w, θ, p); returns (F_ρ, F_m, F_Θ)."""
 @inline function lmars(gas::Gas, ρL, wL, θL, pL, ρR, wR, θR, pR)
@@ -97,53 +156,74 @@ end
 end
 
 """dq/dt of the nonlinear DGSEM operator N(q)."""
-function rhs_nonlinear(eu::Euler1D, q::AbstractVector)
-    np, Ne, J, D, w, gas = eu.np, eu.Ne, eu.J, eu.Dg, eu.wg, eu.gas
-    out = zeros(eu.nq)
-    ρ = field(eu, q, 1); m = field(eu, q, 2); Θ = field(eu, q, 3)
-    W = m ./ ρ; θ = Θ ./ ρ; P = pressure.(Ref(gas), Θ)
-    for e in 1:Ne
-        for i in 1:np
-            sρ = sm = sΘ = 0.0
-            for j in 1:np
-                fρ, fm, fΘ = kg_flux(ρ[i, e], W[i, e], θ[i, e], P[i, e], ρ[j, e], W[j, e], θ[j, e], P[j, e])
-                sρ += D[i, j] * fρ; sm += D[i, j] * fm; sΘ += D[i, j] * fΘ
-            end
-            out[iq(np, e, 1, i)] = -2sρ / J
-            out[iq(np, e, 2, i)] = -2sm / J - gas.g * ρ[i, e]
-            out[iq(np, e, 3, i)] = -2sΘ / J
+rhs_nonlinear(eu, q::AbstractVector) = rhs_nonlinear!(zeros(length(q)), eu, q)
+
+"""In-place N(q) (allocation-free; uses the pressure cache of `eu`)."""
+function rhs_nonlinear!(out, eu::Euler1D, q::AbstractVector)
+    np, Ne, J, D, w, gas, P, φ = eu.np, eu.Ne, eu.J, eu.Dg, eu.wg, eu.gas, eu.P, eu.φ
+    γ, vf, gf = gas.γ, eu.vflux, eu.gflux
+    pointwise = gf === :pointwise
+    @inbounds for e in 1:Ne, i in 1:np
+        P[i, e] = pressure(gas, q[iq(np, e, 3, i)])
+    end
+    @inbounds for e in 1:Ne, i in 1:np
+        ρi = q[iq(np, e, 1, i)]; wi = q[iq(np, e, 2, i)] / ρi; Θi = q[iq(np, e, 3, i)]
+        sρ = sm = sΘ = sg = 0.0
+        for j in 1:np
+            ρj = q[iq(np, e, 1, j)]; wj = q[iq(np, e, 2, j)] / ρj; Θj = q[iq(np, e, 3, j)]
+            vn = 0.5 * (wi + wj)
+            fρ, fΘ = mass_theta_flux(vf, ρi, Θi, ρj, Θj, vn, γ)
+            fm = fρ * vn + 0.5 * (P[i, e] + P[j, e])
+            sρ += D[i, j] * fρ; sm += D[i, j] * fm; sΘ += D[i, j] * fΘ
+            pointwise || (sg += D[i, j] * gravity_mean(gf, ρi, ρj, γ) * (φ[j, e] - φ[i, e]))
         end
+        out[iq(np, e, 1, i)] = -2sρ / J
+        out[iq(np, e, 2, i)] = -2sm / J - (pointwise ? gas.g * ρi : sg / J)
+        out[iq(np, e, 3, i)] = -2sΘ / J
     end
     # surface terms (strong form): q_b' -= n/(J w_b) (F* - f(q_b))
-    for f in 1:Ne+1
-        if f == 1
-            iR, eR = 1, 1
-            st = (ρ[iR, eR], -W[iR, eR], θ[iR, eR], P[iR, eR])
-            F = lmars(gas, st..., ρ[iR, eR], W[iR, eR], θ[iR, eR], P[iR, eR])
-        elseif f == Ne + 1
-            iL, eL = np, Ne
-            F = lmars(gas, ρ[iL, eL], W[iL, eL], θ[iL, eL], P[iL, eL], ρ[iL, eL], -W[iL, eL], θ[iL, eL], P[iL, eL])
-        else
-            F = lmars(gas, ρ[np, f-1], W[np, f-1], θ[np, f-1], P[np, f-1], ρ[1, f], W[1, f], θ[1, f], P[1, f])
-        end
+    @inbounds for f in 1:Ne+1
+        eL, iL = f == 1 ? (1, 1) : (f - 1, np)          # left state (mirror at the bottom wall)
+        eR, iR = f == Ne + 1 ? (Ne, np) : (f, 1)        # right state (mirror at the top wall)
+        ρL = q[iq(np, eL, 1, iL)]; wL = q[iq(np, eL, 2, iL)] / ρL; ΘL = q[iq(np, eL, 3, iL)]
+        ρR = q[iq(np, eR, 1, iR)]; wR = q[iq(np, eR, 2, iR)] / ρR; ΘR = q[iq(np, eR, 3, iR)]
+        f == 1 && (wL = -wR)
+        f == Ne + 1 && (wR = -wL)
+        F = lmars(gas, ρL, wL, ΘL / ρL, P[iL, eL], ρR, wR, ΘR / ρR, P[iR, eR])
         for (e, i, n) in ((f - 1, np, 1.0), (f, 1, -1.0))
             (e < 1 || e > Ne) && continue
-            fb = (m[i, e], m[i, e] * W[i, e] + P[i, e], m[i, e] * θ[i, e])
-            for r in 1:NV
-                out[iq(np, e, r, i)] -= n * (F[r] - fb[r]) / (J * w[i])
-            end
+            ρb = q[iq(np, e, 1, i)]; mb = q[iq(np, e, 2, i)]; wb = mb / ρb
+            fb1 = mb; fb2 = mb * wb + P[i, e]; fb3 = q[iq(np, e, 3, i)] * wb
+            c = n / (J * w[i])
+            out[iq(np, e, 1, i)] -= c * (F[1] - fb1)
+            out[iq(np, e, 2, i)] -= c * (F[2] - fb2)
+            out[iq(np, e, 3, i)] -= c * (F[3] - fb3)
         end
     end
     return out
 end
 
-"""Discrete hydrostatic state of N for Θ(z): m = 0, nodal Θ, ρ = -(D p(Θ))/(g J)."""
-function hydrostatic_state(eu::Euler1D, Θfun)
+"""Discrete hydrostatic state of N for Θ(z): m = 0, nodal Θ, ρ such that the momentum residual
+vanishes (explicit for pointwise gravity, ρ = -(D p(Θ))/(g J); Newton iteration otherwise)."""
+function hydrostatic_state(eu::Euler1D, Θfun; tol = 1e-13, maxit = 30)
     q = zeros(eu.nq)
     for e in 1:eu.Ne
         Θe = Θfun.(zpts(eu, e, eu.xg))
         blk(eu, q, e, 3) .= Θe
         blk(eu, q, e, 1) .= -(eu.Dg * pressure.(Ref(eu.gas), Θe)) ./ (eu.gas.g * eu.J)
+    end
+    eu.gflux === :pointwise && return q
+    iρ = [iq(eu.np, e, 1, i) for e in 1:eu.Ne for i in 1:eu.np]
+    im = [iq(eu.np, e, 2, i) for e in 1:eu.Ne for i in 1:eu.np]
+    for _ in 1:maxit
+        r = rhs_nonlinear(eu, q)[im]
+        maximum(abs, r) < tol * eu.gas.g * maximum(q[iρ]) && break
+        Jr = zeros(length(iρ), length(iρ))
+        for (k, c) in enumerate(iρ)
+            h = 1e-7 * q[c]; qp = copy(q); qp[c] += h
+            Jr[:, k] = (rhs_nonlinear(eu, qp)[im] .- r) ./ h
+        end
+        q[iρ] .-= Jr \ r
     end
     return q
 end
@@ -153,7 +233,7 @@ end
 # ---------------------------------------------------------------------------
 """HDG fast operator (v2) with coefficients frozen at the state q: θ̄ = Θ/ρ, a = pfac p/Θ,
 b = (1 - pfac) p (continuous after DSS)."""
-function fast_operator(eu::Euler1D, q; pfac = eu.gas.γ, eps = 0.0, form = :split, tau_scale = 1.0)
+function fast_operator(eu::Euler1D, q; pfac = eu.gas.γ, eps = 0.0, form = :split, tau_scale = 1.0, fast = :imex)
     ρ = field(eu, q, 1); Θ = field(eu, q, 3)
     P = pressure.(Ref(eu.gas), Θ)
     return HDGRelaxTh(eu.Ne, eu.p, eu.zmin, eu.zmax, pfac .* P ./ Θ, Θ ./ ρ, (1 - pfac) .* P;
@@ -206,49 +286,83 @@ function mis_tableau(name::Symbol)
     error("unknown MIS tableau $name")
 end
 
-"""
-    mis_step(eu, q, Δt, tab; dτ, fast=:imex, pfac=γ, eps=0.0)
+"""Preallocated work vectors of the MIS step (ΔY_i = Y_{i+1} - qⁿ, S_i = S(Y_i))."""
+struct MISWork
+    ΔY::Vector{Vector{Float64}}; S::Vector{Vector{Float64}}
+    Y::Vector{Float64}; Z::Vector{Float64}; Fs::Vector{Float64}; L::Vector{Float64}
+end
+MISWork(nq::Int, ns::Int) = MISWork([zeros(nq) for _ in 1:ns], [zeros(nq) for _ in 1:ns],
+                                    zeros(nq), zeros(nq), zeros(nq), zeros(nq))
 
-One large step. The fast operator is re-frozen at q; each stage integrates the fast ODE over
-d_i Δt with ceil(d_i Δt / dτ) substeps.
+"""Fast substeps per MIS stage: n_i = max(1, round(d_i nsub)); for WSRK3 nsub/3, nsub/2, nsub (WRF)."""
+stage_substeps(tab::MISTableau, nsub::Int) = [max(1, round(Int, d * nsub)) for d in tab.d]
+
 """
-function mis_step(eu, q::AbstractVector, Δt::Real, tab::MISTableau; dτ::Real,
-                  fast::Symbol = :imex, pfac = eu.gas.γ, eps = 0.0, sF = nothing)
-    sF === nothing && (sF = fast_operator(eu, q; pfac = pfac, eps = eps))
-    ns = nstages(tab)
-    ΔY = Vector{Vector{Float64}}(undef, ns)          # Y_{j+1} - qⁿ
-    S = Vector{Vector{Float64}}(undef, ns)           # S(Y_j)
-    Y = q
-    for i in 1:ns
-        S[i] = rhs_nonlinear(eu, Y) .- tendency(sF, Y)
-        Z0 = copy(q)
-        Fs = (tab.β[i, i] / tab.d[i]) .* S[i]
-        for j in 1:i-1
-            Z0 .+= tab.α[i, j] .* ΔY[j]
-            Fs .+= (tab.γ[i, j] / (tab.d[i] * Δt)) .* ΔY[j] .+ (tab.β[i, j] / tab.d[i]) .* S[j]
+    mis_step!(qnew, eu, q, Δt, tab, sF, work; nsub=12, fast=:imex)
+
+One large step with the frozen fast operator sF; stage i integrates the fast system over d_i Δt
+with n_i = max(1, round(d_i nsub)) substeps. qnew may alias q. Allocation-free for models with
+in-place `rhs_nonlinear!` and operators with a cached fast workspace.
+"""
+function mis_step!(qnew, eu, q, Δt, tab::MISTableau, sF, w::MISWork; nsub::Int = 12, fast::Symbol = :imex)
+    for i in 1:nstages(tab)
+        if i == 1
+            w.Y .= q
+        else
+            @. w.Y = q + w.ΔY[i-1]
         end
-        T = tab.d[i] * Δt
-        nsub = max(1, ceil(Int, T / dτ - 1e-10))
-        U = run!(sF, initial_state(sF, Z0), T / nsub, nsub; method = fast, F_slow = Fs)
-        Y = U[1:sF.nq]
-        ΔY[i] = Y .- q
+        S = w.S[i]
+        rhs_nonlinear!(S, eu, w.Y)
+        fast_apply!(w.L, sF, w.Y, sF.fb)                  # L_n(Y_i)
+        S .-= w.L                                          # S(Y_i) = N(Y_i) - L_n(Y_i)
+        d = tab.d[i]
+        c = tab.β[i, i] / d
+        w.Z .= q
+        @. w.Fs = c * S
+        for j in 1:i-1
+            a, g, b = tab.α[i, j], tab.γ[i, j] / (d * Δt), tab.β[i, j] / d
+            ΔYj, Sj = w.ΔY[j], w.S[j]
+            @. w.Z += a * ΔYj
+            @. w.Fs += g * ΔYj + b * Sj
+        end
+        n = max(1, round(Int, d * nsub))
+        fast_solve!(w.Z, sF, w.Z, w.Fs, d * Δt / n, n; method = fast)
+        @. w.ΔY[i] = w.Z - q
     end
-    return Y
+    qnew .= w.Z
+    return qnew
 end
 
 """
-    run_mis(eu, q0, Δt, nsteps; tab=mis_tableau(:MIS4a), dτ, fast=:imex, pfac=γ, refreeze=true,
-            monitor=nothing, every=1)
+    mis_step(eu, q, Δt, tab; nsub=12, fast=:imex, pfac=γ, sF=nothing)
 
-refreeze = false keeps the fast operator frozen at q0 for the whole run.
+Allocating convenience version of `mis_step!` (fast operator frozen at q unless sF is given).
 """
-function run_mis(eu, q0, Δt, nsteps; tab::MISTableau = mis_tableau(:MIS4a), dτ::Real,
+function mis_step(eu, q::AbstractVector, Δt::Real, tab::MISTableau; nsub::Int = 12, fast::Symbol = :imex,
+                  pfac = eu.gas.γ, eps = 0.0, sF = nothing)
+    sF === nothing && (sF = fast_operator(eu, q; pfac = pfac, eps = eps, fast = fast))
+    return mis_step!(similar(q), eu, q, Δt, tab, sF, MISWork(length(q), nstages(tab)); nsub = nsub, fast = fast)
+end
+
+"""
+    run_mis(eu, q0, Δt, nsteps; tab=mis_tableau(:MIS4a), nsub=12, fast=:imex, pfac=γ,
+            refreeze=true, refreeze_every=1, monitor=nothing, every=1)
+
+Split-explicit integration with `nsub` fast substeps per large step (ratio fast/slow; WRF uses
+6 or 12 with RK3; keep it ≤ 24). The fast operator is re-frozen at the current state every
+`refreeze_every` large steps; refreeze = false keeps it frozen at q0.
+"""
+function run_mis(eu, q0, Δt, nsteps; tab::MISTableau = mis_tableau(:MIS4a), nsub::Int = 12,
                  fast::Symbol = :imex, pfac = eu.gas.γ, eps = 0.0, refreeze::Bool = true,
-                 monitor = nothing, every::Int = 1)
-    q = copy(q0)
-    sF = refreeze ? nothing : fast_operator(eu, q0; pfac = pfac, eps = eps)
+                 refreeze_every::Int = 1, monitor = nothing, every::Int = 1)
+    nsub > 24 && @warn "nsub = $nsub fast steps per slow step (ratio > 24)"
+    q = Vector{Float64}(q0)
+    sF = fast_operator(eu, q; pfac = pfac, eps = eps, fast = fast)
+    w = MISWork(length(q), nstages(tab))
     for n in 1:nsteps
-        q = mis_step(eu, q, Δt, tab; dτ = dτ, fast = fast, pfac = pfac, eps = eps, sF = sF)
+        refreeze && n > 1 && (n - 1) % refreeze_every == 0 &&
+            (sF = fast_operator(eu, q; pfac = pfac, eps = eps, fast = fast))
+        mis_step!(q, eu, q, Δt, tab, sF, w; nsub = nsub, fast = fast)
         monitor !== nothing && n % every == 0 && monitor(n, q)
     end
     return q
@@ -256,13 +370,14 @@ end
 
 """Classical RK4 on the full nonlinear operator (reference solution)."""
 function run_rk4(eu, q0, dt, nsteps)
-    q = copy(q0)
+    q = Vector{Float64}(q0)
+    k1, k2, k3, k4, y = (zeros(length(q)) for _ in 1:5)
     for _ in 1:nsteps
-        k1 = rhs_nonlinear(eu, q)
-        k2 = rhs_nonlinear(eu, q .+ (dt / 2) .* k1)
-        k3 = rhs_nonlinear(eu, q .+ (dt / 2) .* k2)
-        k4 = rhs_nonlinear(eu, q .+ dt .* k3)
-        q .+= (dt / 6) .* (k1 .+ 2 .* k2 .+ 2 .* k3 .+ k4)
+        rhs_nonlinear!(k1, eu, q)
+        @. y = q + (dt / 2) * k1; rhs_nonlinear!(k2, eu, y)
+        @. y = q + (dt / 2) * k2; rhs_nonlinear!(k3, eu, y)
+        @. y = q + dt * k3;       rhs_nonlinear!(k4, eu, y)
+        @. q += (dt / 6) * (k1 + 2k2 + 2k3 + k4)
     end
     return q
 end

@@ -1,6 +1,7 @@
 # Verification and demo for HDGRelaxTheta.jl (DGSEM, energy-stable split form).
 # Standard library only; writes CSV files.   Run:  julia --project=examples examples/v2_theta_report.jl
-# Python reference values (same algorithm) are given in the comments.
+# Time integration: explicit IMEX (DIRK was removed); Python reference values in the comments
+# were obtained with DIRK and are kept for orientation.
 
 using HDGEulerGravity.HDGRelaxTheta
 using LinearAlgebra, Printf, Random
@@ -25,6 +26,8 @@ function normal_mode(fr, Lz)
     return t -> (z -> real.(v .* exp.(im * k .* permutedims(z) .+ λ * t)))
 end
 
+"""Spatial convergence with the 2nd-order IMEX scheme: dt = cfl h/c (h/h₁)^((p-1)/2) keeps the
+time error O(h^(p+1)) below the spatial one."""
 function convergence(method, ef; ps = (1, 2, 3), Nes = (8, 16, 32, 64), form = :split)
     fr = const_frozen(); Lz = 2000.0; ex = normal_mode(fr, Lz)
     c = sqrt(coef_a(fr, 0.0) * fr.theta(0.0)); Tend = Lz / c
@@ -34,7 +37,7 @@ function convergence(method, ef; ps = (1, 2, 3), Nes = (8, 16, 32, 64), form = :
         for (k, Ne) in enumerate(Nes)
             s = HDGRelaxTh(Ne, p, 0.0, Lz, fr; bc = :periodic, eps = ef * (Lz / Ne) / c, form = form)
             U0 = initial_state(s, project(s, ex(0.0)))
-            cfl = (method == :dirk ? 1.0 : 0.2) / (2p + 1)
+            cfl = 0.2 / (2p + 1) * (Nes[1] / Ne)^((p - 1) / 2)
             n = ceil(Int, Tend / (cfl * s.h / c))
             U = run!(s, U0, Tend / n, n; method = method)
             E[k, :] = l2_error(s, U[1:s.nq], ex(Tend))
@@ -51,12 +54,12 @@ function eps_sweep(; Ne = 16, p = 3)
     c = sqrt(coef_a(fr, 0.0) * fr.theta(0.0)); Tend = Lz / c
     facs = 10.0 .^ (-8:0)
     res = Dict{Symbol,Vector{Float64}}()
-    for method in (:dirk, :imex)
+    for method in (:imex,)
         errs = Float64[]
         for fac in vcat(facs, 0.0)
             s = HDGRelaxTh(Ne, p, 0.0, Lz, fr; bc = :periodic, eps = fac * (Lz / Ne) / c)
             U0 = initial_state(s, project(s, ex(0.0)))
-            cfl = (method == :dirk ? 1.0 : 0.2) / (2p + 1)
+            cfl = 0.2 / (2p + 1)
             n = ceil(Int, Tend / (cfl * s.h / c))
             U = run!(s, U0, Tend / n, n; method = method)
             push!(errs, l2_error(s, U[1:s.nq], ex(Tend))[3])
@@ -99,9 +102,10 @@ function long_run_growth()
         qb = balanced_state(s, z -> atm_Theta(atm, z))
         dq = 1e-3 .* randn(MersenneTwister(1), s.nq)
         E0 = energy(s, dq)
-        U = run!(s, initial_state(s, qb .+ dq), 20.0, 1080; method = :dirk)
-        @printf("  %-8s: random perturbation, 6 h with dt=20 s: E(6h)/E(0) = %.3e\n",
-                form, energy(s, U[1:s.nq] .- qb) / E0)
+        n = ceil(Int, 6 * 3600 / (0.2 / 7 * s.h / s.cmax))
+        U = run!(s, initial_state(s, qb .+ dq), 6 * 3600 / n, n; method = :imex)
+        @printf("  %-8s: random perturbation, 6 h (IMEX, %d steps): E(6h)/E(0) = %.3e\n",
+                form, n, energy(s, U[1:s.nq] .- qb) / E0)
     end
 end
 
@@ -111,7 +115,7 @@ function well_balanced(method, eps, pfac)
     s = HDGRelaxTh(40, 3, 0.0, 10000.0, frozen_from_atmosphere(atm; pfac = pfac); bc = :wall, eps = eps)
     q = balanced_state(s, z -> atm_Theta(atm, z))
     U0 = initial_state(s, q)
-    dt = (method == :dirk ? 1.0 : 0.2 / 7) * s.h / s.cmax
+    dt = 0.2 / 7 * s.h / s.cmax
     U = run!(s, U0, dt, 200; method = method)
     @printf("  pfac=%.1f %-4s eps=%g: max rel. deviation after 200 steps = %.2e\n",
             pfac, method, eps, maximum(abs.(U .- U0)) / maximum(abs.(U0)))
@@ -136,7 +140,7 @@ function slow_forcing_check()
     qs = project(s, z -> vcat(permutedims(atm_rho.(Ref(atm), z)), 0 .* permutedims(z),
                               permutedims(atm_Theta.(Ref(atm), z)))) .+ 1e-3 .* randn(MersenneTwister(0), s.nq)
     F = -tendency(s, qs)
-    for method in (:dirk, :imex)
+    for method in (:imex,)
         U = run!(s, initial_state(s, qs), 0.05 * s.h / s.cmax, 50; method = method, F_slow = F)
         @printf("  %s: q* with F_slow = -L(q*) stays steady, max|q - q*| = %.2e\n",
                 method, maximum(abs.(U[1:s.nq] .- qs)))
@@ -147,10 +151,10 @@ end
 function wall_demo()
     atm = Atmosphere(T0 = 288.0, Γ = 0.0065)
     Lz, Ne, p = 10000.0, 80, 3
-    cases = [("pfac=1 eps=0 DIRK split", 1.0, 0.0, :dirk, :split),
+    cases = [("pfac=1 eps=0 IMEX split", 1.0, 0.0, :imex, :split),
              ("pfac=1 eps=1e-4h/c IMEX split", 1.0, 1e-4, :imex, :split),
-             ("pfac=gamma eps=0 DIRK split", atm.γ, 0.0, :dirk, :split),
-             ("pfac=1 eps=0 DIRK standard", 1.0, 0.0, :dirk, :standard)]
+             ("pfac=gamma eps=0 IMEX split", atm.γ, 0.0, :imex, :split),
+             ("pfac=1 eps=0 IMEX standard", 1.0, 0.0, :imex, :standard)]
     open("theta_wall_profile.csv", "w") do fp
         open("theta_wall_history.csv", "w") do fh
             println(fp, "case,z,pprime")
@@ -167,7 +171,7 @@ function wall_demo()
                 m0, T0 = total(s, qb .+ dq, 1), total(s, qb .+ dq, 3)
                 E0 = energy(s, dq)
                 Tend = 25.0
-                cfl = (method == :dirk ? 0.5 : 0.2) / (2p + 1)
+                cfl = 0.2 / (2p + 1)
                 n = ceil(Int, Tend / (cfl * s.h / s.cmax)); dt = Tend / n
                 dm = Float64[]; dT = Float64[]; Er = Float64[]
                 mon = (k, U) -> begin
@@ -198,21 +202,21 @@ function main()
     #   p=3: 3.131e-03 1.957e-04 1.224e-05 7.655e-07  rates 4.00
     open("theta_convergence.csv", "w") do f
         println(f, "form,method,eps_fac,p,Ne,err_Theta")
-        for (method, ef) in [(:dirk, 0.0), (:dirk, 1e-9), (:imex, 1e-9)]
-            Nes, out = convergence(method, ef; ps = method == :dirk ? (1, 2, 3) : (1, 2))
+        for (method, ef) in [(:imex, 0.0), (:imex, 1e-9)]
+            Nes, out = convergence(method, ef; ps = (1, 2, 3))
             for (p, errs) in sort(collect(out)), (Ne, e) in zip(Nes, errs)
                 println(f, "split,$method,$ef,$p,$Ne,$e")
             end
         end
-        convergence(:dirk, 0.0; ps = (3,), form = :standard)   # ref: 3.122e-03 ... 7.618e-07
+        convergence(:imex, 0.0; ps = (3,), form = :standard)   # ref: 3.122e-03 ... 7.618e-07
     end
     println("\n1b) Relaxation error vs eps (Ne=16, p=3)")
     # Python reference dirk: 1.957e-04 1.966e-04 2.523e-04 1.569e-03 1.553e-02 ...
     facs, sw = eps_sweep()
     open("theta_eps_sweep.csv", "w") do f
-        println(f, "eps_fac,err_dirk,err_imex")
+        println(f, "eps_fac,err_imex")
         for k in eachindex(facs)
-            println(f, facs[k], ",", sw[:dirk][k], ",", sw[:imex][k])
+            println(f, facs[k], ",", sw[:imex][k])
         end
     end
     println("\n2) Stability: largest real part of the spectrum (walls, p=3, eps=0)")
@@ -222,7 +226,7 @@ function main()
     long_run_growth()
     println("\n3) Well-balancing (discrete hydrostatic state, lapse-rate atmosphere, walls)")
     # Python reference: ~1e-12 (dirk), ~1e-15 (imex)
-    for pfac in (1.0, 1.4), (method, eps) in [(:dirk, 0.0), (:dirk, 1e-3), (:imex, 1e-3)]
+    for pfac in (1.0, 1.4), (method, eps) in [(:imex, 0.0), (:imex, 1e-3)]
         well_balanced(method, eps, pfac)
     end
     # Python reference: pfac=1 ~1e-12 (exact balance); pfac=1.4: 1.618e-05 2.027e-06 2.537e-07 3.174e-08

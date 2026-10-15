@@ -29,10 +29,10 @@ function test_balance()
     eu = Euler1D(20, 4, 0.0, 1e4)
     qb = hydrostatic_state(eu, z -> atm_Theta(ATM, z))
     @printf("  max|N(q_b)| = %.2e\n", maximum(abs.(rhs_nonlinear(eu, qb))))
-    dτ = fast_dt(eu, qb)
-    for name in (:WSRK3, :MIS4a), fast in (:imex, :dirk)
-        q = run_mis(eu, qb, 10.0, 30; tab = mis_tableau(name), dτ = fast == :imex ? dτ : 0.5, fast = fast)
-        @printf("  %-6s fast=%-4s Δt=10 s, 30 steps: max rel. deviation = %.2e\n", name, fast,
+    Δt = 12fast_dt(eu, qb)
+    for name in (:WSRK3, :MIS4a)
+        q = run_mis(eu, qb, Δt, 30; tab = mis_tableau(name), nsub = 12)
+        @printf("  %-6s nsub=12, Δt=%.3f s, 30 steps: max rel. deviation = %.2e\n", name, Δt,
                 maximum(abs.(q .- qb) ./ max.(abs.(qb), 1.0)))
     end
 end
@@ -43,11 +43,11 @@ function test_refrozen_stability()
         eu = Euler1D(Ne, p, 0.0, 1e4)
         qb = hydrostatic_state(eu, z -> atm_Theta(ATM, z))
         q0 = qb .+ project(eu, perturbation(pulse = 500.0, wp = 200.0))
-        q = run_mis(eu, q0, 2.0, 10; tab = mis_tableau(:WSRK3), dτ = fast_dt(eu, q0))   # discontinuous now
+        q = run_mis(eu, q0, 12fast_dt(eu, q0), 10; tab = mis_tableau(:WSRK3), nsub = 12)   # discontinuous now
         jmp = maximum(abs(blk(eu, q, e, 3)[end] / blk(eu, q, e, 1)[end] - blk(eu, q, e + 1, 3)[1] / blk(eu, q, e + 1, 1)[1])
                       for e in 1:eu.Ne-1)
         s = fast_operator(eu, q)
-        λ = eigvals(Matrix(spdiagm_inv(s.Mdiag) * (s.K + s.G * s.H)))
+        λ = eigvals(Matrix(spdiagm_inv(s.Mdiag) * s.A))
         @printf("  p=%d Ne=%2d: max |[θ]| at faces = %.2e K,  max Re λ = %.2e,  max |λ| = %.2e\n",
                 p, Ne, jmp, maximum(real.(λ)), maximum(abs.(λ)))
     end
@@ -55,7 +55,8 @@ end
 spdiagm_inv(d) = Diagonal(1 ./ d)
 
 function test_convergence()
-    println("\n3) Temporal convergence against RK4 on N (Ne=20, p=4, T=10 s, fast part: DIRK, dτ=0.01 s)")
+    println("\n3) Temporal convergence against RK4 on N (Ne=20, p=4, T=10 s, fast part: IMEX, nsub=24)")
+    println("   (fixed ratio: the 2nd-order fast integrator limits the observed order to 2)")
     eu = Euler1D(20, 4, 0.0, 1e4)
     qb = hydrostatic_state(eu, z -> atm_Theta(ATM, z))
     q0 = qb .+ project(eu, perturbation(wp = 500.0, wb = 800.0))
@@ -65,12 +66,12 @@ function test_convergence()
     qref = run_rk4(eu, q0, T / nref, nref)
     @printf("  reference: RK4, %d steps; Δmass = %.1e, ΔΘ = %.1e\n", nref,
             total(eu, qref, 1) - total(eu, q0, 1), total(eu, qref, 3) - total(eu, q0, 3))
-    dts = (2.0, 1.0, 0.5, 0.25)
+    dts = (0.5, 0.25, 0.125, 0.0625)              # dτ ≈ Δt/24 within the explicit limit
     rows = String[]
     for name in TABLES
         errs = Float64[]
         for Δt in dts
-            q = run_mis(eu, q0, Δt, round(Int, T / Δt); tab = mis_tableau(name), dτ = 0.01, fast = :dirk)
+            q = run_mis(eu, q0, Δt, round(Int, T / Δt); tab = mis_tableau(name), nsub = 24)
             push!(errs, l2_error(eu, q .- qref)[2])
         end
         rates = [log2(errs[k] / errs[k+1]) for k in 1:length(errs)-1]
@@ -114,21 +115,22 @@ function test_stability_function()
 end
 
 function test_long_run()
-    println("\n5) Split-explicit runs: Ne=40, p=4, 600 s, fast part IMEX at acoustic CFL 0.1 (re-frozen each step)")
+    println("\n5) Split-explicit runs: Ne=40, p=4, 600 s, fast part IMEX at acoustic CFL 0.2, Δt = nsub dτ")
     eu = Euler1D(40, 4, 0.0, 1e4)
     qb = hydrostatic_state(eu, z -> atm_Theta(ATM, z))
     q0 = qb .+ project(eu, perturbation())
-    dτ = fast_dt(eu, q0)
+    dτ = fast_dt(eu, q0; cfl = 0.2)
     @printf("  dτ = %.4f s\n", dτ)
     mn = mnodes(eu)
     open("mis_long_run.csv", "w") do f
         println(f, "table,dt,t,max_abs_m")
-        for name in TABLES, Δt in (5.0, 10.0)
+        for name in TABLES, nsub in (6, 12, 24)
+            Δt = 600 / ceil(600 / (nsub * dτ))
             mx = 0.0
-            q = run_mis(eu, q0, Δt, round(Int, 600 / Δt); tab = mis_tableau(name), dτ = dτ,
+            q = run_mis(eu, q0, Δt, round(Int, 600 / Δt); tab = mis_tableau(name), nsub = nsub,
                         monitor = (n, q) -> (m = maximum(abs.(q[mn])); mx = max(mx, m); println(f, "$name,$Δt,$(n * Δt),$m")))
-            @printf("  %-6s Δt=%4.1f s (%4d substeps): max|m| = %.3e, final max|m| = %.3e, Δmass = %.1e, ΔΘ = %.1e\n",
-                    name, Δt, ceil(Int, Δt / dτ), mx, maximum(abs.(q[mn])), total(eu, q, 1) - total(eu, q0, 1),
+            @printf("  %-6s nsub=%2d Δt=%.3f s: max|m| = %.3e, final max|m| = %.3e, Δmass = %.1e, ΔΘ = %.1e\n",
+                    name, nsub, Δt, mx, maximum(abs.(q[mn])), total(eu, q, 1) - total(eu, q0, 1),
                     total(eu, q, 3) - total(eu, q0, 3))
         end
     end
