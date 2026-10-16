@@ -1,11 +1,11 @@
 # Nonlinear operator N
 
-"""LMARS flux along the unit normal (nx, nz) from inside L to outside R."""
-@inline function lmars2(γ, ρL, uL, wL, θL, pL, ρR, uR, wR, θR, pR, nx, nz)
+"""LMARS flux along the unit normal (nx, nz) from inside L to outside R; sound speed cfix if > 0."""
+@inline function lmars2(γ, cfix, ρL, uL, wL, θL, pL, ρR, uR, wR, θR, pR, nx, nz)
     unL = uL * nx + wL * nz
     unR = uR * nx + wR * nz
     ρm = 0.5 * (ρL + ρR)
-    cm = 0.5 * (sqrt(γ * pL / ρL) + sqrt(γ * pR / ρR))
+    cm = cfix > 0 ? cfix : 0.5 * (sqrt(γ * pL / ρL) + sqrt(γ * pR / ρR))
     ws = 0.5 * (unL + unR) - (pR - pL) / (2 * ρm * cm)
     ps = 0.5 * (pL + pR) - 0.5 * ρm * cm * (unR - unL)
     if ws >= 0
@@ -53,7 +53,7 @@ end
         n1, n2 = nx / s, nz / s
         ρL = q[node_iq(np, eL, 1, iL, jL)]
         ρR = q[node_iq(np, eR, 1, iR, jR)]
-        F1, F2, F3, F4 = lmars2(m.gas.γ, ρL, c.U[iL, jL, eL], c.W[iL, jL, eL], q[node_iq(np, eL, 4, iL, jL)] / ρL, c.P[iL, jL, eL],
+        F1, F2, F3, F4 = lmars2(m.gas.γ, m.clmars, ρL, c.U[iL, jL, eL], c.W[iL, jL, eL], q[node_iq(np, eL, 4, iL, jL)] / ρL, c.P[iL, jL, eL],
                                 ρR, c.U[iR, jR, eR], c.W[iR, jR, eR], q[node_iq(np, eR, 4, iR, jR)] / ρR, c.P[iR, jR, eR], n1, n2)
         side_update!(out, m, q, iL, jL, eL, nx, nz, we, s * F1, s * F2, s * F3, s * F4)
         side_update!(out, m, q, iR, jR, eR, -nx, -nz, we, -s * F1, -s * F2, -s * F3, -s * F4)
@@ -71,7 +71,7 @@ end
         θ = q[node_iq(np, e, 4, i, j)] / ρ
         u, w, p = c.U[i, j, e], c.W[i, j, e], c.P[i, j, e]
         un = u * n1 + w * n2
-        F1, F2, F3, F4 = lmars2(m.gas.γ, ρ, u, w, θ, p, ρ, u - 2un * n1, w - 2un * n2, θ, p, n1, n2)
+        F1, F2, F3, F4 = lmars2(m.gas.γ, m.clmars, ρ, u, w, θ, p, ρ, u - 2un * n1, w - 2un * n2, θ, p, n1, n2)
         side_update!(out, m, q, i, j, e, nx, nz, we, s * F1, s * F2, s * F3, s * F4)
     end
     return nothing

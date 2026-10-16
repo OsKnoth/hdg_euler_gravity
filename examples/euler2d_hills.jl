@@ -41,17 +41,23 @@ const ZCMP = 3e3                       # comparison level for w
 # crest at the element centre nearest L/2 (CREST=face: at L/2, an element face for even NEX)
 xm = get(ENV, "CREST", "center") == "center" ? (floor(NEX / 2) + 0.5) * L / NEX : L / 2
 cgz = U * min(1.0, U / (NBV * a))
-αsponge = 5cgz / (H - ZD)
+αsponge = parse(Float64, get(ENV, "SPONGE", string(5cgz / (H - ZD))))   # env SPONGE: rate [1/s]
 
 gas = Gas()
 ρr, Θr, θr = E2.stratified_reference(gas; θ0 = θ0, N = NBV)
 mesh = E2.Mesh2D(NEX, NEZ, P, L, H; zs = x -> h0 / (1 + ((x - xm) / a)^2))
-model0 = E2.Euler2DModel(mesh, gas, ρr, Θr)
+# nonlinear fluxes: FLUX=tec|kg, GRAV=waruszewski|souza, CLMARS=c (constant LMARS sound speed, 0: local)
+# (FLUX=kg GRAV=souza CLMARS=340 is the CGDycore setting)
+const FLUX = Symbol(get(ENV, "FLUX", "tec"))
+const GRAV = Symbol(get(ENV, "GRAV", "waruszewski"))
+const CLMARS = parse(Float64, get(ENV, "CLMARS", "0"))
+model0 = E2.Euler2DModel(mesh, gas, ρr, Θr; volume_flux = FLUX, gravity = GRAV, c_lmars = CLMARS)
 q0 = E2.project2d(model0, (x, z) -> (ρr(z), ρr(z) * U, 0.0, Θr(z)))
 model = E2.with_sponge(model0, q0; zD = ZD, αtop = αsponge)
 Δt = T / ceil(T / (NSUB * fast_step(model, q0, FAST)))
 @printf("hill %s: a = %.0f km, H = %.0f m, U = %.0f m/s, N = %.3f 1/s, Na/U = %.0f, NH/U = %.1f\n",
         case, a / 1e3, h0, U, NBV, NBV * a / U, NBV * h0 / U)
+@printf("volume flux %s, gravity %s, LMARS sound speed %s\n", FLUX, GRAV, CLMARS > 0 ? string(CLMARS) : "local")
 @printf("domain %.0f km × %.1f km, p = %d, %d × %d elements, Δx(node) = %.0f m, unknowns = %d, T = %.0f s, sponge α = %.1e 1/s\n",
         L / 1e3, H / 1e3, P, NEX, NEZ, L / (NEX * P), model.nq, T, αsponge)
 

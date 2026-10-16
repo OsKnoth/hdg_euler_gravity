@@ -19,30 +19,34 @@ struct Euler2DModel
     qtarget::Vector{Float64}    # state the sponge relaxes to
     vflux::Symbol
     gflux::Symbol
+    clmars::Float64             # LMARS sound speed: > 0 constant, 0 local mean
     nres::Vector{Float64}       # N of the reference state, subtracted (exact balance)
     cache::NCache
     fastref::Base.RefValue{Any} # fast operator, reused (re-frozen in place)
 end
 
 """
-    Euler2DModel(mesh, gas, ρref, Θref; volume_flux=:tec, gravity=:waruszewski, subtract_reference=true)
+    Euler2DModel(mesh, gas, ρref, Θref; volume_flux=:tec, gravity=:waruszewski, subtract_reference=true,
+                 c_lmars=0)
 
 Hydrostatic reference given by functions ρref(z), Θref(z). Gravity enters as the
 non-conservative two-point term ρ_avg (φ_k - φ_i), φ = g z (SBP-compatible with flux
 differencing; a pointwise source -g ρ_i makes the linearization about stratified states
 unstable with a growth rate O(h)). With subtract_reference the residual of the nodal reference
 state is subtracted, so it is steady to round-off for any background and over terrain (this
-does not change the Jacobian). Fluxes: see `SplitExplicitEuler.Euler1D`.
+does not change the Jacobian). Fluxes: see `SplitExplicitEuler.Euler1D`; volume_flux=:kg with
+gravity=:souza is the Kennedy–Gruber split form with the arithmetic-mean gravity term (CGDycore).
+c_lmars > 0: constant sound speed in the LMARS interface flux (0: mean of the local values).
 """
 function Euler2DModel(mesh::Mesh2D, gas::Gas, ρref, Θref; volume_flux::Symbol = :tec,
-                      gravity::Symbol = :waruszewski, subtract_reference::Bool = true)
+                      gravity::Symbol = :waruszewski, subtract_reference::Bool = true, c_lmars::Real = 0.0)
     volume_flux in (:kg, :tec, :ec, :etec) || error("unknown volume_flux $volume_flux")
     gravity in (:souza, :waruszewski, :artiano) || error("unknown gravity $gravity")
     R = ρref.(mesh.Z)
     T = Θref.(mesh.Z)
     nq = mesh.Ne * NV * mesh.np^2
     m = Euler2DModel(mesh, gas, nq, R, T, pressure.(Ref(gas), T), zeros(nq), zeros(nq), volume_flux, gravity,
-                     zeros(nq), NCache(mesh.np, mesh.Ne), Ref{Any}(nothing))
+                     Float64(c_lmars), zeros(nq), NCache(mesh.np, mesh.Ne), Ref{Any}(nothing))
     subtract_reference || return m
     qr = zeros(nq)
     Q = fields(m, qr)
@@ -76,7 +80,7 @@ function with_sponge(m::Euler2DModel, qtarget::AbstractVector; zD::Real, αtop::
         α[k] = a
     end
     damp = vec(reshape(repeat(reshape(α, M.np, M.np, 1, M.Ne), 1, 1, NV, 1), :))
-    return Euler2DModel(M, m.gas, m.nq, m.ρref, m.Θref, m.pref, damp, Vector{Float64}(qtarget), m.vflux, m.gflux,
+    return Euler2DModel(M, m.gas, m.nq, m.ρref, m.Θref, m.pref, damp, Vector{Float64}(qtarget), m.vflux, m.gflux, m.clmars,
                         m.nres, m.cache, m.fastref)
 end
 
