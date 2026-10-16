@@ -9,6 +9,9 @@ const V1 = HDGEulerGravity.HDGRelaxEuler
 const V2 = HDGEulerGravity.HDGRelaxTheta
 const V3 = HDGEulerGravity.SplitExplicitEuler
 const E2 = HDGEulerGravity.Euler2D
+const FV = HDGEulerGravity.FV2D
+const TS = HDGEulerGravity.TimeStepping
+const CM = HDGEulerGravity.Common
 
 rate(e1, e2) = log2(e1 / e2)
 
@@ -129,9 +132,14 @@ end
         @test abs(E2.total2d(m, Nq, 4)) < 1e-12 * E2.total2d(m, q, 4)
         s = E2.fast_operator(m, qr; fast = :hevi)                                            # energy stable
         @test maximum(real.(eigvals(E2.fast_matrix(s)))) < 1e-12
-        z = zeros(m.nq); kv = zeros(m.nq)                                                    # HEVI matrix = matrix-free vertical part
-        E2.fast_kernel!(kv, s, q, z, Val(false), Val(true))
-        @test maximum(abs.(s.Av * q ./ s.Mdiag .- kv)) < 1e-10 * maximum(abs.(kv))
+        sv = E2.fast_operator(m, q; fast = :hevi, reuse = false)                              # HEVI column solver
+        Av = zeros(m.nq, m.nq); ev = zeros(m.nq); col = zeros(m.nq)                          # = dense solve
+        for k in 1:m.nq
+            ev[k] = 1.0; E2.vertical_apply!(col, sv, ev); Av[:, k] .= col; ev[k] = 0.0
+        end
+        Ys = q .* (1 .+ 0.1 .* sin.(1:m.nq)); Y = similar(Ys)
+        E2.hevi_solve!(Y, sv, E2.hevi_factor(sv, 3.0 * V2.IMEX_GM), Ys)   # factor of I - c A_v, c = dt γ
+        @test norm(Y .- (I - 3.0 * V2.IMEX_GM * Av) \ Ys) < 1e-12 * norm(Y)
         s = E2.fast_operator(m, q)                                                           # bounded growth
         @test maximum(real.(eigvals(E2.fast_matrix(s)))) < 1e-3
     end
@@ -200,6 +208,8 @@ end
         qq = copy(q0)
         @test allocs(() -> V2.fast_solve!(qq, s2, q0, nothing, 0.05, 5; method = :verlet)) == 0
         @test allocs(() -> V2.fast_solve!(qq, s2, q0, nothing, 0.05, 5; method = :fb)) == 0
+        sh2 = E2.fast_operator(m, q0; fast = :hevi, reuse = false)
+        @test allocs(() -> V2.fast_solve!(qq, sh2, q0, nothing, 0.5, 5; method = :hevi)) < 50_000
     end
     e = [norm(V3.run_mis(m, q0, Δt, round(Int, 100 / Δt); tab = V3.mis_tableau(:MIS4), nsub = 12,
                          fast = :verlet) .- qref) for Δt in (8.0, 4.0)]
@@ -220,6 +230,80 @@ end
         @test allocs(() -> V3.mis_step!(qq, m, q0, 4.0, tab, sh, w; nsub = 12, fast = :imex)) == 0
         se = E2.fast_operator(m, q0; reuse = false)               # explicit only: no LU factors
         @test allocs(() -> E2.refreeze!(se, m, q0, 1.4)) == 0     # coefficients re-frozen in place
+    end
+end
+
+@testset "FV2D: WRF-style C-grid" begin
+    gas = CM.Gas()
+    ρr, Θr, θr = CM.stratified_reference(gas)
+    g = FV.FVGrid(8, 6, 40e3, 10e3)
+    m = FV.FVModel(g, gas, ρr, Θr)
+    qr = CM.project2d(m, (x, z) -> (ρr(z), 0.0, 0.0, Θr(z)))
+    @test maximum(abs.(TS.rhs_nonlinear(m, qr))) == 0                                   # rest state exact
+    q = CM.project2d(m, (x, z) -> (ρr(z) * (1 - 0.01 * exp(-((x - 15e3)^2 + (z - 4e3)^2) / 3e3^2)), 10ρr(z),
+                                   0.3ρr(z) * sin(2π * x / 40e3), Θr(z)))
+    Nq = TS.rhs_nonlinear(m, q)
+    @test abs(CM.total2d(m, Nq, 1)) < 1e-12 * CM.total2d(m, q, 1)                        # conservation
+    @test abs(CM.total2d(m, Nq, 4)) < 1e-12 * CM.total2d(m, q, 4)
+    s = FV.fast_operator(m, q; reuse = false)
+    kf, kT, km, kh, kv, kH, kt = (zeros(m.nq) for _ in 1:7)
+    TS.fast_apply!(kf, s, q, s.fb)
+    TS.fast_rhs_thermo!(kT, s, q, s.fb)
+    TS.fast_rhs_momentum!(km, s, q, s.fb)
+    TS.fast_rhs_horizontal!(kh, s, q, s.fb)
+    TS.vertical_apply!(kv, s, q)
+    TS.fast_rhs_hmomentum!(kH, s, q, s.fb)
+    TS.fast_rhs_hthermo!(kt, s, q, s.fb)
+    @test maximum(abs.(kT .+ km .- kf)) < 1e-14 * maximum(abs.(kf))                    # splits
+    @test maximum(abs.(kh .+ kv .- kf)) < 1e-14 * maximum(abs.(kf))
+    @test maximum(abs.(kH .+ kt .- kh)) < 1e-14 * maximum(abs.(kh))
+    Av = zeros(m.nq, m.nq)
+    e = zeros(m.nq)
+    col = zeros(m.nq)
+    for k in 1:m.nq
+        e[k] = 1.0
+        TS.vertical_apply!(col, s, e)
+        Av[:, k] .= col
+        e[k] = 0.0
+    end
+    Ys = q .* (1 .+ 0.1 .* sin.(1:m.nq))
+    Y = similar(Ys)
+    TS.vertical_solve!(Y, s, TS.vertical_factor(s, 2.0), Ys)
+    @test norm(Y .- (I - 2.0 * Av) \ Ys) < 1e-12 * norm(Y)                                # tridiagonal solver
+    sr = FV.fast_operator(m, qr; reuse = false)
+    @test maximum(abs.(real.(eigvals(FV.fast_matrix(sr))))) < 1e-12                     # energy conserving at rest
+
+    # gravity-wave setup: MIS against RK4 on N
+    gw = FV.FVGrid(40, 10, 100e3, 10e3)
+    mw = FV.FVModel(gw, gas, ρr, Θr)
+    q0 = CM.project2d(mw, (x, z) -> (ρ = Θr(z) / (θr(z) + 0.01 * sin(π * z / 10e3) / (1 + ((x - 50e3) / 5e3)^2));
+                                     (ρ, 20ρ, 0.0, Θr(z))))
+    c = CM.sound_speed_max(mw, q0)
+    nref = ceil(Int, 200 / (0.3 * gw.dz / (c + 20)))
+    qref = TS.run_rk4(mw, q0, 200 / nref, nref)
+    dev = norm(qref .- q0)
+    # :wrf is first order in dτ (off-centring β = 0.55), so with a fixed ratio nsub the order is 1
+    for (tab, nsub, fast, lim, order) in ((:WSRK3, 6, :wrf, gw.dx, 1.0), (:MIS4, 12, :verlet, gw.dz, 2.0))
+        Δt1 = nsub * 0.8 * lim / c
+        errs = [norm(TS.run_mis(mw, q0, Δt, round(Int, 200 / Δt); tab = TS.mis_tableau(tab), nsub = nsub,
+                                fast = fast) .- qref) for Δt in (200 / ceil(200 / Δt1), 100 / ceil(200 / Δt1))]
+        @test errs[2] < 0.05 * dev
+        @test rate(errs...) > order - 0.3
+    end
+    qb = CM.project2d(mw, (x, z) -> (ρr(z), 0.0, 0.0, Θr(z)))
+    qw = TS.run_mis(mw, qb, 20.0, 5; tab = TS.mis_tableau(:WSRK3), nsub = 6, fast = :wrf)
+    @test maximum(abs.(qw .- qb) ./ max.(abs.(qb), 1.0)) < 1e-12                       # well balanced
+
+    let mw = mw, q0 = q0                                                                # allocation-free
+        out = zeros(mw.nq)
+        @test allocs(() -> TS.rhs_nonlinear!(out, mw, q0)) == 0
+        sw = FV.fast_operator(mw, q0)
+        qq = copy(q0)
+        @test allocs(() -> TS.fast_solve!(qq, sw, q0, nothing, 1.0, 5; method = :wrf)) == 0
+        @test allocs(() -> TS.fast_solve!(qq, sw, q0, nothing, 1.0, 5; method = :verlet)) == 0
+        w = TS.MISWork(mw.nq, 3)
+        tab = TS.mis_tableau(:WSRK3)
+        @test allocs(() -> TS.mis_step!(qq, mw, q0, 20.0, tab, sw, w; nsub = 6, fast = :wrf)) == 0
     end
 end
 

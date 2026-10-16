@@ -1,21 +1,32 @@
 """
     HDGEulerGravity
 
-Hybridized DG with LMARS flux and relaxed trace conditions for the Euler equations with gravity.
+Split-explicit time integration of the compressible Euler equations with gravity in
+potential-temperature form, with two spatial discretizations sharing the time steppers.
 
-Submodules (each with its own exports; load with e.g. `using HDGEulerGravity.SplitExplicitEuler`):
-  HDGRelaxEuler       v1: modal DG, linearized about a hydrostatic state, perturbations (ρ', ρ₀w', p')
-  HDGRelaxTheta       v2: nodal DGSEM fast linear operator in (ρ, ρw, ρθ), energy-stable split form
-  SplitExplicitEuler  v3: MIS split-explicit solver for the nonlinear equations, fast part = v2
-  Euler2D             2D (x–z slice, terrain) nonlinear DGSEM + fast HDG operator, MIS via v3
+Submodules (load with e.g. `using HDGEulerGravity.Euler2D`):
+  Common              gas, pressure, reference atmospheres
+  TimeStepping        MIS / WS-RK3 split-explicit stepper, fast integrators (:imex, :hevi,
+                      :verlet, :fb, :wrf), RK4 reference; interface for the discretizations
+  DGSEM:
+    HDGRelaxTheta     1D nodal DGSEM fast operator (HDG, LMARS, relaxed traces, energy-stable split form)
+    SplitExplicitEuler 1D nonlinear DGSEM with the fast operator of HDGRelaxTheta
+    Euler2D           2D x–z DGSEM with terrain, matrix-free fast operator, HEVI column solver
+  FV:
+    FV2D              WRF-style finite volumes on an Arakawa C-grid (flat)
+  Legacy:
+    HDGRelaxEuler     v1: modal DG, linearized perturbation equations
 """
 module HDGEulerGravity
 
-include("HDGRelaxEuler.jl")
-include("HDGRelaxTheta.jl")
-include("SplitExplicitEuler.jl")
-include("Euler2D.jl")
+include("Common/Common.jl")
+include("TimeStepping/TimeStepping.jl")
+include("Legacy/HDGRelaxEuler.jl")
+include("DGSEM/HDGRelaxTheta/HDGRelaxTheta.jl")
+include("DGSEM/SplitExplicitEuler/SplitExplicitEuler.jl")
+include("DGSEM/Euler2D/Euler2D.jl")
+include("FV/FV2D.jl")
 
-export HDGRelaxEuler, HDGRelaxTheta, SplitExplicitEuler, Euler2D
+export Common, TimeStepping, HDGRelaxEuler, HDGRelaxTheta, SplitExplicitEuler, Euler2D, FV2D
 
 end # module
